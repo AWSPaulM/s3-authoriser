@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lambda@Edge stack for CloudFront S3 password protection.
+  Deploys a viewer-request Lambda function that enforces HTTP Basic Auth
+  on configured folders. The deploy script attaches it to CloudFront via CLI.
+
+Parameters:
+  DistributionId:
+    Type: String
+    Description: Existing CloudFront distribution ID to protect
+
+  PasswordMapJson:
+    Type: String
+    Default: '{}'
+    Description: >
+      JSON string mapping folder names to passwords.
+      Example: {"secret-docs":"mypassword","finance":"budget2026"}
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  AuthFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'cf-password-protect-${DistributionId}'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile:
+          Fn::Sub: |
+            'use strict';
+
+            const PASSWORD_MAP = ${PasswordMapJson};
+
+            function extractFolder(uri) {
+              if (!uri || uri === '/') {
+                return null;
+              }
+              const withoutLeadingSlash = uri.startsWith('/') ? uri.slice(1) : uri;
+              const slashIndex = withoutLeadingSlash.indexOf('/');
+              const segment = slashIndex === -1 ? withoutLeadingSlash : withoutLeadingSlash.slice(0, slashIndex);
+              if (!segment) {
+                return null;
+              }
+              try {
+                return decodeURIComponent(segment);
+              } catch (e) {
+                return segment;
+              }
+            }
+
+            function parseBasicAuth(authHeader) {
+              if (!authHeader || !authHeader.startsWith('Basic ')) {
+                return null;
+              }
+              const encoded = authHeader.slice(6);
+              if (!encoded) {
+                return null;
+              }
+              let decoded;
+              try {
+                decoded = Buffer.from(encoded, 'base64').toString('utf-8');
+              } catch (e) {
+                return null;
+              }
+              const colonIndex = decoded.indexOf(':');
+              if (colonIndex === -1) {
+                return null;
+              }
+              return { password: decoded.slice(colonIndex + 1) };
+            }
+
+            function buildUnauthorizedResponse(realm) {
+              return {
+                status: '401',
+                statusDescription: 'Unauthorized',
+                headers: {
+                  'www-authenticate': [
+                    {
+                      key: 'WWW-Authenticate',
+                      value: 'Basic realm="' + realm + '"',
+                    },
+                  ],
+                  'content-type': [
+                    {
+                      key: 'Content-Type',
+                      value: 'text/html',
+                    },
+                  ],
+                },
+                body: '<html><body><h1>401 Unauthorized</h1><p>Authentication is required to access this resource.</p></body></html>',
+              };
+            }
+
+            exports.handler = async (event) => {
+              const request = event.Records[0].cf.request;
+              try {
+                const folder = extractFolder(request.uri);
+                if (!folder || !(folder in PASSWORD_MAP)) {
+                  return request;
+                }
+                const expectedPassword = PASSWORD_MAP[folder];
+                const authHeader =
+                  request.headers.authorization &&
+                  request.headers.authorization[0] &&
+                  request.headers.authorization[0].value;
+                if (!authHeader) {
+                  return buildUnauthorizedResponse('Protected');
+                }
+                const credentials = parseBasicAuth(authHeader);
+                if (!credentials || credentials.password !== expectedPassword) {
+                  return buildUnauthorizedResponse('Protected');
+                }
+                return request;
+              } catch (e) {
+                return request;
+              }
+            };
+
+  AuthFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref AuthFunction
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda@Edge function
+    Value: !GetAtt AuthFunction.Arn
+
+  LambdaVersionArn:
+    Description: ARN of the Lambda@Edge function version (required for CloudFront association)
+    Value: !Ref AuthFunctionVersion
